@@ -1,0 +1,12 @@
+- 
+  exp_name: "FlowEdit_SANA"
+  dataset_yaml: edits.yaml
+  model_type: "SANA"
+  sampler_type: "FlowEditSANA"
+  T_steps: 50             # SANA is fast, 28 steps is standard
+  n_avg: 1
+  src_guidance_scale: 1.5 # SANA default is usually 5.0
+  tar_guidance_scale: 7.5
+  n_min: 0
+  n_max: 33           # Don't skip steps to avoid blur!
+  seed: 42

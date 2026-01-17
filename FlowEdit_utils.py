@@ -402,3 +402,104 @@ def FlowEditFLUX(pipe,
     return unpacked_out
 
 
+def calc_v_sana_cfg(pipe, latents, prompt_embeds, negative_embeds, guidance_scale, t):
+    # Inputs to FP16
+    latents_input = torch.cat([latents] * 2).half()
+    timestep = t.expand(latents_input.shape[0])
+    text_embeds_input = torch.cat([negative_embeds, prompt_embeds])
+
+    # Run the model
+    with torch.no_grad():
+        noise_pred = pipe.transformer(
+            hidden_states=latents_input,
+            timestep=timestep,
+            encoder_hidden_states=text_embeds_input,
+            return_dict=False,
+        )[0]
+        
+    # Switch to FP32
+    with torch.autocast("cuda", enabled=False):
+        noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+        
+        # Cast to FP32
+        u = noise_pred_uncond.float()
+        g = noise_pred_text.float()
+        
+        # CFG formula
+        v_pred = u + guidance_scale * (g - u)
+
+    return v_pred
+
+@torch.no_grad()
+def FlowEditSANA(
+    pipe,
+    x_src,
+    src_prompt,
+    tar_prompt,
+    negative_prompt="", 
+    T_steps: int = 28,
+    n_avg: int = 1,
+    src_guidance_scale: float = 3.5,
+    tar_guidance_scale: float = 5.5,
+    n_min: int = 0,
+    n_max: int = 28,
+):
+    device = x_src.device
+    pipe.scheduler.set_timesteps(T_steps, device=device)
+    timesteps = pipe.scheduler.timesteps
+
+    # Encode Prompts
+    src_embeds, _, _, _ = pipe.encode_prompt(prompt=src_prompt, device=device, do_classifier_free_guidance=False)
+    tar_embeds, _, _, _ = pipe.encode_prompt(prompt=tar_prompt, device=device, do_classifier_free_guidance=False)
+    neg_embeds, _, _, _ = pipe.encode_prompt(prompt=negative_prompt, device=device, do_classifier_free_guidance=False)
+    
+    # Initialize State in FP32
+    x_src_fp32 = x_src.float()
+    zt_edit = x_src_fp32.clone()
+
+    for i, t in tqdm(enumerate(timesteps)):
+        if T_steps - i > n_max: continue
+        
+        t_curr = (t / 1000.0).float()
+        if i + 1 < len(timesteps):
+             t_im1 = (timesteps[i+1] / 1000.0).float()
+        else:
+             t_im1 = torch.tensor(0.0, device=device).float()
+             
+
+        with torch.autocast("cuda", enabled=False):
+            
+            # Pseudo inversion
+            if T_steps - i > n_min:
+                V_delta_avg = torch.zeros_like(x_src_fp32)
+                
+                for k in range(n_avg):
+                    fwd_noise = torch.randn_like(x_src_fp32)
+                    zt_src = (1 - t_curr) * x_src_fp32 + t_curr * fwd_noise
+                    zt_tar = zt_edit + (zt_src - x_src_fp32)
+
+                    Vt_src = calc_v_sana_cfg(pipe, zt_src, src_embeds, neg_embeds, src_guidance_scale, t)
+                    Vt_tar = calc_v_sana_cfg(pipe, zt_tar, tar_embeds, neg_embeds, tar_guidance_scale, t)
+
+                    V_delta_avg += (1/n_avg) * (Vt_tar - Vt_src)
+
+                dt = t_im1 - t_curr
+                zt_edit = zt_edit + dt * V_delta_avg
+
+            # B. GENERATION
+            else:
+                if i == T_steps - n_min:
+                    xt_tar = zt_edit
+                    
+                Vt_tar = calc_v_sana_cfg(pipe, xt_tar, tar_embeds, neg_embeds, tar_guidance_scale, t)
+                dt = t_im1 - t_curr
+                xt_tar = xt_tar + dt * Vt_tar
+
+    # Final Stats Check
+    print(f"DEBUG: Final Latent Stats: Min={zt_edit.min():.2f}, Max={zt_edit.max():.2f}")
+    
+    # Safe Return: Replace remaining NaNs with 0
+    result = zt_edit if n_min == 0 else xt_tar
+    result = torch.nan_to_num(result, nan=0.0, posinf=10.0, neginf=-10.0)
+    
+    return result.half()

@@ -3,42 +3,63 @@ from diffusers import StableDiffusion3Pipeline
 from diffusers import FluxPipeline
 from PIL import Image
 import argparse
-import random 
+import random
 import numpy as np
 import yaml
 import os
 from FlowEdit_utils import FlowEditSD3, FlowEditFLUX
-
+# ... inside imports ...
+from diffusers import SanaPipeline
+# Make sure to import your new function
+from FlowEdit_utils import FlowEditSANA
 
 
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device_number", type=int, default=0, help="device number to use")
-    parser.add_argument("--exp_yaml", type=str, default="FLUX_exp.yaml", help="experiment yaml file")
-
+    parser.add_argument("--device_number", type=int,
+                        default=0, help="device number to use")
+    parser.add_argument("--exp_yaml", type=str,
+                        default="FLUX_exp.yaml", help="experiment yaml file")
+    parser.add_argument("--token_hf", type=str,
+                        default=None, help="define token for hf")
     args = parser.parse_args()
 
     # set device
     device_number = args.device_number
-    device = torch.device(f"cuda:{device_number}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(
+        f"cuda:{device_number}" if torch.cuda.is_available() else "cpu")
 
     # load exp yaml file to dict
     exp_yaml = args.exp_yaml
     with open(exp_yaml) as file:
         exp_configs = yaml.load(file, Loader=yaml.FullLoader)
 
-    device = torch.device(f"cuda:{device_number}" if torch.cuda.is_available() else "cpu")
-    model_type = exp_configs[0]["model_type"] # currently only one model type per run
-
+    device = torch.device(
+        f"cuda:{device_number}" if torch.cuda.is_available() else "cpu")
+    # currently only one model type per run
+    model_type = exp_configs[0]["model_type"]
+    my_token = args.token_hf
     if model_type == 'FLUX':
-        # pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.float16) 
-        pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-dev", torch_dtype=torch.float16)
+        # pipe = FluxPipeline.from_pretrained("black-forest-labs/FLUX.1-schnell", torch_dtype=torch.float16)
+        pipe = FluxPipeline.from_pretrained(
+            "black-forest-labs/FLUX.1-dev", torch_dtype=torch.float16, token=my_token)
     elif model_type == 'SD3':
-        pipe = StableDiffusion3Pipeline.from_pretrained("stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float16)
+        pipe = StableDiffusion3Pipeline.from_pretrained(
+            "stabilityai/stable-diffusion-3-medium-diffusers", torch_dtype=torch.float16, token=my_token)
+
+    elif model_type == 'SANA':
+        # Load SANA-0.6B (Small, Fast, Flow-Matching)
+        pipe = SanaPipeline.from_pretrained(
+            "Efficient-Large-Model/Sana_600M_1024px_diffusers",
+            variant="fp16",
+            torch_dtype=torch.float16,
+            token=my_token
+        )
+        pipe.vae.to(dtype=torch.float32)
     else:
         raise NotImplementedError(f"Model type {model_type} not implemented")
-    
+
     scheduler = pipe.scheduler
     pipe = pipe.to(device)
 
@@ -63,7 +84,7 @@ if __name__ == "__main__":
         with open(dataset_yaml) as file:
             dataset_configs = yaml.load(file, Loader=yaml.FullLoader)
 
-        # check dataset_configs 
+        # check dataset_configs
         for data_dict in dataset_configs:
             tar_prompts = data_dict["target_prompts"]
 
@@ -71,79 +92,147 @@ if __name__ == "__main__":
 
             src_prompt = data_dict["source_prompt"]
             tar_prompts = data_dict["target_prompts"]
-            negative_prompt =  "" # optionally add support for negative prompts (SD3)
+            # optionally add support for negative prompts (SD3)
+            negative_prompt = ""
             image_src_path = data_dict["input_img"]
 
             # load image
             image = Image.open(image_src_path)
-            # crop image to have both dimensions divisibe by 16 - avoids issues with resizing
-            image = image.crop((0, 0, image.width - image.width % 16, image.height - image.height % 16))
+            image = image.crop((0, 0, image.width - image.width %
+                               32, image.height - image.height % 32))
             image_src = pipe.image_processor.preprocess(image)
             # cast image to half precision
-            image_src = image_src.to(device).half()
-            with torch.autocast("cuda"), torch.inference_mode():
-                x0_src_denorm = pipe.vae.encode(image_src).latent_dist.mode()
-            x0_src = (x0_src_denorm - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+            image_src = image_src.to(device)
+            
+            with torch.inference_mode():
+                # Run the encoder
+                encoded = pipe.vae.encode(image_src)
+
+                if model_type == 'SD3':
+                    # SD3 specific logic
+                    x0_src = encoded.latent_dist.mode()
+                    x0_src = (x0_src - pipe.vae.config.shift_factor) * \
+                        pipe.vae.config.scaling_factor
+
+                elif model_type == 'SANA':
+                    # SANA (DC-AE) logic: it checks for 'latents' attribute
+                    if hasattr(encoded, "latents"):
+                        x0_src = encoded.latents
+                    else:
+                        # Fallback if it returns a tuple
+                        x0_src = encoded[0]
+
+                    # SANA does not need scaling but safe to check config
+                    if hasattr(pipe.vae.config, "scaling_factor"):
+                        x0_src = x0_src * pipe.vae.config.scaling_factor
+
+                else:
+                    # FLUX / SD 1.5 Logic: Standard VAE
+                    if hasattr(encoded, "latent_dist"):
+                        x0_src = encoded.latent_dist.sample()
+                    else:
+                        x0_src = encoded.latents
+
+                    # Apply scaling if needed
+                    if hasattr(pipe.vae.config, "shift_factor"):
+                        x0_src = (x0_src - pipe.vae.config.shift_factor) * \
+                            pipe.vae.config.scaling_factor
+                    elif hasattr(pipe.vae.config, "scaling_factor"):
+                        x0_src = x0_src * pipe.vae.config.scaling_factor
+
             # send to cuda
             x0_src = x0_src.to(device)
-            
+
             for tar_num, tar_prompt in enumerate(tar_prompts):
 
                 if model_type == 'SD3':
                     x0_tar = FlowEditSD3(pipe,
-                                                            scheduler,
-                                                            x0_src,
-                                                            src_prompt,
-                                                            tar_prompt,
-                                                            negative_prompt,
-                                                            T_steps,
-                                                            n_avg,
-                                                            src_guidance_scale,
-                                                            tar_guidance_scale,
-                                                            n_min,
-                                                            n_max,)
-                    
+                                         scheduler,
+                                         x0_src,
+                                         src_prompt,
+                                         tar_prompt,
+                                         negative_prompt,
+                                         T_steps,
+                                         n_avg,
+                                         src_guidance_scale,
+                                         tar_guidance_scale,
+                                         n_min,
+                                         n_max,)
+
                 elif model_type == 'FLUX':
                     x0_tar = FlowEditFLUX(pipe,
-                                                            scheduler,
-                                                            x0_src,
-                                                            src_prompt,
-                                                            tar_prompt,
-                                                            negative_prompt,
-                                                            T_steps,
-                                                            n_avg,
-                                                            src_guidance_scale,
-                                                            tar_guidance_scale,
-                                                            n_min,
-                                                            n_max,)
+                                          scheduler,
+                                          x0_src,
+                                          src_prompt,
+                                          tar_prompt,
+                                          negative_prompt,
+                                          T_steps,
+                                          n_avg,
+                                          src_guidance_scale,
+                                          tar_guidance_scale,
+                                          n_min,
+                                          n_max,)
+                elif model_type == 'SANA':
+                    x0_tar = FlowEditSANA(pipe,
+                                          scheduler,
+                                          x0_src,
+                                          src_prompt,
+                                          tar_prompt,
+                                          negative_prompt,
+                                          T_steps,
+                                          n_avg,
+                                          src_guidance_scale,
+                                          tar_guidance_scale,
+                                          n_min,
+                                          n_max
+                                          )
                 else:
-                    raise NotImplementedError(f"Sampler type {model_type} not implemented")
+                    raise NotImplementedError(
+                        f"Sampler type {model_type} not implemented")
 
+                x0_tar = x0_tar.float()
+                with torch.inference_mode():
+                    if model_type == 'SD3':
+                        # SD3: Explicit shift and scale logic
+                        x0_tar = (x0_tar / pipe.vae.config.scaling_factor) + \
+                            pipe.vae.config.shift_factor
+                        image_tar = pipe.vae.decode(
+                            x0_tar, return_dict=False)[0]
 
-                x0_tar_denorm = (x0_tar / pipe.vae.config.scaling_factor) + pipe.vae.config.shift_factor
-                with torch.autocast("cuda"), torch.inference_mode():
-                    image_tar = pipe.vae.decode(x0_tar_denorm, return_dict=False)[0]
-                image_tar = pipe.image_processor.postprocess(image_tar)
+                    else:
+                        # SANA / FLUX
+                        # 1. Reverse scaling (if config has it)
+                        if hasattr(pipe.vae.config, "scaling_factor"):
+                            x0_tar = x0_tar / pipe.vae.config.scaling_factor
 
-                src_prompt_txt = data_dict["input_img"].split("/")[-1].split(".")[0]
+                        # 2. Reverse shift (Only if config has it)
+                        if hasattr(pipe.vae.config, "shift_factor"):
+                            x0_tar = x0_tar + pipe.vae.config.shift_factor
+
+                        # 3. Decode
+                        image_tar = pipe.vae.decode(
+                            x0_tar, return_dict=False)[0]
+
+                image_tar = pipe.image_processor.postprocess(
+                    image_tar, output_type="pil")
+
+                src_prompt_txt = data_dict["input_img"].split(
+                    "/")[-1].split(".")[0]
 
                 tar_prompt_txt = str(tar_num)
-                
+
                 # make sure to create the directories before saving
                 save_dir = f"outputs/{exp_name}/{model_type}/src_{src_prompt_txt}/tar_{tar_prompt_txt}"
                 os.makedirs(save_dir, exist_ok=True)
-                
-                image_tar[0].save(f"{save_dir}/output_T_steps_{T_steps}_n_avg_{n_avg}_cfg_enc_{src_guidance_scale}_cfg_dec{tar_guidance_scale}_n_min_{n_min}_n_max_{n_max}_seed{seed}.png")
+
+                image_tar[0].save(
+                    f"{save_dir}/output_T_steps_{T_steps}_n_avg_{n_avg}_cfg_enc_{src_guidance_scale}_cfg_dec{tar_guidance_scale}_n_min_{n_min}_n_max_{n_max}_seed{seed}.png")
                 # also save source and target prompt in txt file
                 with open(f"{save_dir}/prompts.txt", "w") as f:
                     f.write(f"Source prompt: {src_prompt}\n")
                     f.write(f"Target prompt: {tar_prompt}\n")
                     f.write(f"Seed: {seed}\n")
                     f.write(f"Sampler type: {model_type}\n")
-                
-
-
-
 
     print("Done")
 
