@@ -8,6 +8,10 @@
 
 ### [ICCV 2025 Best Student Paper] Official Pytorch implementation of the paper: "FlowEdit: Inversion-Free Text-Based Editing Using Pre-Trained Flow Models"
 
+### OUR MODIFIED VERSION OF FLOWEDIT IS COMPATIBLE WITH SANA MODEL DEVELOPED BY NVIDIA.
+
+We adding support for SANA model in the FlowEdit implementation. You can now use FlowEdit with SANA for text-based image editing tasks. The parameters were fine-tuned based on qualitative results to ensure optimal performance.
+
 ![](imgs/teaser.png)
 
 ## Installation
